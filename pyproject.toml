@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "open-agent-cli"
-version = "0.1.0"
-description = "A terminal coding agent for OpenAI-compatible APIs"
+version = "0.3.0"
+description = "A modern terminal coding agent for OpenAI-compatible APIs"
 requires-python = ">=3.11"
 dependencies = []
 

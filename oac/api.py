@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import random
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -9,6 +11,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from .config import Config
+from .usage import Usage
 
 
 class APIError(RuntimeError):
@@ -49,8 +52,11 @@ def metadata(record: dict) -> Model:
 
 
 class Client:
+    RETRYABLE = {429, 500, 502, 503, 504}
+
     def __init__(self, config: Config):
         self.config = config
+        self.usage = Usage()
         parsed = urllib.parse.urlsplit(config.base_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise ValueError("base_url must be an HTTP(S) URL without credentials, query, or fragment")
@@ -58,12 +64,27 @@ class Client:
             raise ValueError("Use HTTPS for remote APIs; HTTP is allowed only for loopback servers")
         self.base = config.base_url.rstrip("/")
 
+    def _backoff(self, attempt: int) -> float:
+        return min(10.0, self.config.retry_backoff * (2 ** attempt) + random.uniform(0, 0.15))
+
     def request(self, path: str, payload: dict | None = None, stream: bool = False):
+        data = json.dumps(payload).encode() if payload is not None else None
+        attempts = max(0, self.config.retries) + 1
+        for attempt in range(attempts):
+            try:
+                return self._attempt(path, data, stream)
+            except APIError as exc:
+                if attempt == attempts - 1 or not getattr(exc, "retryable", False):
+                    raise
+                delay = getattr(exc, "retry_after", None)
+                time.sleep(delay if delay is not None else self._backoff(attempt))
+
+    def _attempt(self, path: str, data: bytes | None, stream: bool):
         headers = {"Content-Type": "application/json", "Accept": "text/event-stream" if stream else "application/json"}
         key = os.environ.get(self.config.api_key_env)
         if key:
             headers["Authorization"] = f"Bearer {key}"
-        req = urllib.request.Request(self.base + path, data=json.dumps(payload).encode() if payload is not None else None, headers=headers)
+        req = urllib.request.Request(self.base + path, data=data, headers=headers)
         # Do not forward authorization to redirects (including a redirect to another host).
         class NoRedirect(urllib.request.HTTPRedirectHandler):
             def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -74,9 +95,21 @@ class Client:
             detail = exc.read(8192).decode(errors="replace")
             if key:
                 detail = detail.replace(key, "[redacted]")
-            raise APIError(f"API HTTP {exc.code}: {detail}") from None
+            error = APIError(f"API HTTP {exc.code}: {detail}")
+            if exc.code in self.RETRYABLE:
+                error.retryable = True  # type: ignore[attr-defined]
+                if exc.headers:
+                    retry_after = exc.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            error.retry_after = min(30.0, max(0.0, float(retry_after)))  # type: ignore[attr-defined]
+                        except ValueError:
+                            pass
+            raise error from None
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise APIError(f"API connection failed: {exc}") from None
+            error = APIError(f"API connection failed: {exc}")
+            error.retryable = True  # type: ignore[attr-defined]
+            raise error from None
         if stream:
             return response
         with response:
@@ -132,25 +165,39 @@ class Client:
         payload = {"model": model.id, "messages": messages, "max_completion_tokens": limit, "stream": bool(on_text)}
         if tools:
             payload["tools"] = tools
+        if on_text:
+            # Ask OpenAI-compatible servers to report token usage in the final stream chunk.
+            payload["stream_options"] = {"include_usage": True}
         # max_tokens is required by some older compatible servers. Retry only this parameter error.
         try:
             result = self.request("/chat/completions", payload, bool(on_text))
         except APIError as exc:
-            if "400" not in str(exc) or "max_completion_tokens" not in str(exc):
+            text = str(exc)
+            if "400" in text and "max_completion_tokens" in text:
+                payload["max_tokens"] = payload.pop("max_completion_tokens")
+                result = self.request("/chat/completions", payload, bool(on_text))
+            elif "400" in text and "stream_options" in text:
+                payload.pop("stream_options", None)
+                result = self.request("/chat/completions", payload, bool(on_text))
+            else:
                 raise
-            payload["max_tokens"] = payload.pop("max_completion_tokens")
-            result = self.request("/chat/completions", payload, bool(on_text))
         if not on_text:
             try:
-                return result["choices"][0]["message"]
+                message = result["choices"][0]["message"]
             except (KeyError, IndexError, TypeError):
                 raise APIError("Completion response contains no assistant message") from None
+            usage = result.get("usage") or {}
+            self.usage.add(model.id, usage.get("prompt_tokens"), usage.get("completion_tokens"))
+            return message
         text_parts: list[str] = []
         calls: dict[int, dict] = {}
+        stream_usage: dict = {}
         with result:
             for event in sse(result):
                 if event.get("error"):
                     raise APIError(f"Stream error: {event['error']}")
+                if event.get("usage"):
+                    stream_usage = event["usage"]
                 for choice in event.get("choices", []):
                     delta = choice.get("delta", {})
                     if delta.get("content"):
@@ -161,6 +208,8 @@ class Client:
                         entry["id"] += call.get("id", "")
                         for key in ("name", "arguments"):
                             entry["function"][key] += call.get("function", {}).get(key, "")
+        if stream_usage:
+            self.usage.add(model.id, stream_usage.get("prompt_tokens"), stream_usage.get("completion_tokens"))
         if not text_parts and not calls:
             raise APIError("Stream returned no text or tool calls")
         message = {"role": "assistant", "content": "".join(text_parts) or None}
@@ -176,6 +225,16 @@ class Client:
                 instructions.append(message["content"])
             elif message["role"] == "tool":
                 items.append({"type": "function_call_output", "call_id": message["tool_call_id"], "output": message["content"]})
+            elif isinstance(message.get("content"), list):
+                # Multimodal user turn: text + image parts.
+                parts = []
+                for piece in message["content"]:
+                    if piece.get("type") == "text":
+                        parts.append({"type": "input_text", "text": str(piece.get("text", ""))})
+                    elif piece.get("type") == "image_url":
+                        url = str((piece.get("image_url") or {}).get("url", ""))
+                        parts.append({"type": "input_image", "image_url": url})
+                items.append({"role": message["role"], "content": parts or [{"type": "input_text", "text": ""}]})
             else:
                 if message.get("content"):
                     items.append({"role": message["role"], "content": message["content"]})
@@ -186,6 +245,8 @@ class Client:
             payload["tools"] = [{"type": "function", **tool["function"]} for tool in tools]
         # Nonstreaming Responses is supported by more compatible gateways.
         result = self.request("/responses", payload)
+        usage = result.get("usage") or {}
+        self.usage.add(model, usage.get("input_tokens"), usage.get("output_tokens"))
         parts, calls = [], []
         for item in result.get("output", []):
             if item.get("type") == "function_call":
